@@ -4,12 +4,21 @@ FastAPI server with NLP pipeline, session memory, and LLM integration.
 Run with: uvicorn main:app --reload
 """
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 from typing import Optional
 import json
+import os
+import time
 import uuid
+import logging
+
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 from memory import (
     get_or_create_session,
@@ -17,17 +26,47 @@ from memory import (
     get_history,
     get_memory_length,
     clear_session,
+    get_all_sessions,
 )
-from nlp_pipeline import run_full_pipeline, analyze_sentiment, detect_intent, extract_entities
-from llm_handler import get_llm_response
+from nlp_pipeline import run_full_pipeline
+from vector_memory import upsert_exchange, query_similar_exchanges
+from llm_handler import (
+    get_llm_response,
+    generate_followups,
+    get_runtime_mode,
+    get_provider_diagnostics,
+)
 
 # ── App Setup ───────────────────────────────────────────────────────────────
+
+
+class JSONFormatter(logging.Formatter):
+    def format(self, record):
+        return json.dumps(
+            {
+                "ts": self.formatTime(record),
+                "level": record.levelname,
+                "msg": record.getMessage(),
+                **getattr(record, "extra", {}),
+            }
+        )
+
+
+logger = logging.getLogger("nova")
+logger.setLevel(logging.INFO)
+_handler = logging.StreamHandler()
+_handler.setFormatter(JSONFormatter())
+logger.handlers = [_handler]
+
+limiter = Limiter(key_func=get_remote_address)
 
 app = FastAPI(
     title="NOVA AI Chatbot API",
     description="Advanced AI chatbot with NLP pipeline — Sentiment, Intent, NER, and LLM",
     version="1.0.0",
 )
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
@@ -41,8 +80,21 @@ app.add_middleware(
 # ── Request/Response Models ─────────────────────────────────────────────────
 
 class ChatRequest(BaseModel):
-    message: str
+    message: str = Field(..., min_length=1, max_length=2000)
     session_id: Optional[str] = None
+    response_style: Optional[str] = "balanced"
+    temperature: Optional[float] = 0.4
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    for err in exc.errors():
+        if err.get("loc", []) and err.get("loc", [])[-1] == "message" and err.get("type") == "string_too_long":
+            return JSONResponse(
+                status_code=422,
+                content={"detail": "Message too long (max 2000 characters)"},
+            )
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
 
 class ChatResponse(BaseModel):
@@ -50,8 +102,22 @@ class ChatResponse(BaseModel):
     sentiment: dict
     intent: dict
     entities: list
+    suggestions: list
+    followups: list
+    runtime_mode: str
     memory_length: int
     session_id: str
+
+
+def _build_vector_context(similar: list[dict]) -> str:
+    if not similar:
+        return ""
+    lines = ["[Relevant Past Exchanges]"]
+    for i, item in enumerate(similar[:3], start=1):
+        doc = (item or {}).get("document", "")
+        if doc:
+            lines.append(f"{i}. {doc}")
+    return "\n\n".join(lines)
 
 
 # ── REST Endpoints ──────────────────────────────────────────────────────────
@@ -76,8 +142,23 @@ async def health_check():
     return {"status": "healthy", "model": "NOVA v1.0"}
 
 
+@app.get("/debug/provider")
+async def provider_debug():
+    """Operational diagnostics for provider/runtime behavior."""
+    sessions = get_all_sessions()
+    total_messages = sum(s.get("message_count", 0) for s in sessions.values())
+    return {
+        **get_provider_diagnostics(),
+        "memory": {
+            "active_sessions": len(sessions),
+            "total_messages": total_messages,
+        },
+    }
+
+
 @app.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest):
+@limiter.limit("30/minute")
+async def chat(request: Request, body: ChatRequest):
     """
     Main chat endpoint.
     1. Run NLP pipeline on user message
@@ -87,26 +168,84 @@ async def chat(request: ChatRequest):
     5. Return response + NLP analysis
     """
     # Get or create session
-    session_id = get_or_create_session(request.session_id)
+    request_id = str(uuid.uuid4())[:8]
+    start_time = time.time()
+
+    session_id = get_or_create_session(body.session_id)
     
     # Run NLP pipeline on user message
-    nlp_results = run_full_pipeline(request.message)
+    nlp_results = await run_full_pipeline(body.message)
     
     # Get conversation history for context
     history = get_history(session_id)
+
+    # Retrieve semantically similar past exchanges (session-scoped)
+    history_for_llm = list(history)
+    try:
+        similar = query_similar_exchanges(session_id, body.message, top_k=3)
+        memory_context = _build_vector_context(similar)
+        if memory_context:
+            history_for_llm = [{"role": "assistant", "content": memory_context}] + history_for_llm
+    except Exception as e:
+        logger.warning(
+            "VECTOR_QUERY_FAILED",
+            extra={"extra": {"request_id": request_id, "session_id": session_id, "error": str(e)}},
+        )
     
     # Get LLM response
-    reply = await get_llm_response(request.message, history)
+    reply = await get_llm_response(
+        user_message=body.message,
+        history=history_for_llm,
+        nlp_results=nlp_results,
+        response_style=(body.response_style or "balanced"),
+        temperature=body.temperature if body.temperature is not None else 0.4,
+    )
+
+    suggestions = await generate_followups(
+        llm_response_text=reply,
+        history=history,
+        response_style=(body.response_style or "balanced"),
+        nlp_results=nlp_results,
+    )
     
     # Store both messages in memory
-    add_message(session_id, "user", request.message)
+    add_message(session_id, "user", body.message)
     add_message(session_id, "assistant", reply)
+
+    # Upsert user-assistant exchange into vector memory (session-scoped)
+    try:
+        upsert_exchange(session_id, body.message, reply)
+    except Exception as e:
+        logger.warning(
+            "VECTOR_UPSERT_FAILED",
+            extra={"extra": {"request_id": request_id, "session_id": session_id, "error": str(e)}},
+        )
+
+    provider_used = get_provider_diagnostics().get("active_provider", "unknown")
+    response_time_ms = int((time.time() - start_time) * 1000)
+    log_extra = {
+        "extra": {
+            "request_id": request_id,
+            "session_id": session_id,
+            "message_length": len(body.message),
+            "provider_used": provider_used,
+            "response_time_ms": response_time_ms,
+            "intent_detected": nlp_results.get("intent", {}).get("top_intent", "unknown"),
+            "sentiment_score": nlp_results.get("sentiment", {}).get("compound", 0.0),
+        }
+    }
+    logger.info("CHAT_REQUEST", extra=log_extra)
+    if response_time_ms > 5000:
+        logger.warning("SLOW_REQUEST", extra=log_extra)
     
     return ChatResponse(
         reply=reply,
         sentiment=nlp_results["sentiment"],
         intent=nlp_results["intent"],
         entities=nlp_results["entities"],
+        suggestions=suggestions,
+        followups=suggestions,
+        runtime_mode=get_runtime_mode(),
         memory_length=get_memory_length(session_id),
         session_id=session_id,
     )
@@ -129,7 +268,7 @@ async def clear_memory(request: ClearRequest):
 @app.get("/analyze")
 async def analyze_text(text: str):
     """Analyze text without sending to LLM — useful for NLP demo."""
-    return run_full_pipeline(text)
+    return await run_full_pipeline(text)
 
 
 # ── WebSocket Endpoint ──────────────────────────────────────────────────────
@@ -153,7 +292,7 @@ async def websocket_chat(websocket: WebSocket, session_id: str):
                 continue
             
             # Run NLP pipeline
-            nlp_results = run_full_pipeline(user_message)
+            nlp_results = await run_full_pipeline(user_message)
             
             # Send NLP results immediately
             await websocket.send_text(json.dumps({
@@ -165,13 +304,44 @@ async def websocket_chat(websocket: WebSocket, session_id: str):
             
             # Get conversation history
             history = get_history(session_id)
+
+            # Retrieve semantically similar past exchanges
+            history_for_llm = list(history)
+            try:
+                similar = query_similar_exchanges(session_id, user_message, top_k=3)
+                memory_context = _build_vector_context(similar)
+                if memory_context:
+                    history_for_llm = [{"role": "assistant", "content": memory_context}] + history_for_llm
+            except Exception as e:
+                logger.warning(
+                    "VECTOR_QUERY_FAILED",
+                    extra={"extra": {"session_id": session_id, "error": str(e), "channel": "websocket"}},
+                )
             
             # Generate response
-            reply = await get_llm_response(user_message, history)
+            reply = await get_llm_response(
+                user_message=user_message,
+                history=history_for_llm,
+                nlp_results=nlp_results,
+            )
+
+            suggestions = await generate_followups(
+                llm_response_text=reply,
+                history=history,
+                response_style="balanced",
+                nlp_results=nlp_results,
+            )
             
             # Store in memory
             add_message(session_id, "user", user_message)
             add_message(session_id, "assistant", reply)
+            try:
+                upsert_exchange(session_id, user_message, reply)
+            except Exception as e:
+                logger.warning(
+                    "VECTOR_UPSERT_FAILED",
+                    extra={"extra": {"session_id": session_id, "error": str(e), "channel": "websocket"}},
+                )
             
             # Send complete response
             await websocket.send_text(json.dumps({
@@ -180,6 +350,9 @@ async def websocket_chat(websocket: WebSocket, session_id: str):
                 "sentiment": nlp_results["sentiment"],
                 "intent": nlp_results["intent"],
                 "entities": nlp_results["entities"],
+                "suggestions": suggestions,
+                "followups": suggestions,
+                "runtime_mode": get_runtime_mode(),
                 "memory_length": get_memory_length(session_id),
                 "session_id": session_id,
             }))
@@ -195,6 +368,15 @@ async def websocket_chat(websocket: WebSocket, session_id: str):
 
 @app.on_event("startup")
 async def startup_event():
+    warnings = []
+    if not any([os.getenv(f"GEMINI_API_KEY_{i}") for i in range(1, 4)] + [os.getenv("GEMINI_API_KEY")]):
+        warnings.append("No Gemini keys found — will use fallback providers")
+    if not os.getenv("GROQ_API_KEY"):
+        warnings.append("GROQ_API_KEY missing — Groq fallback disabled")
+    for warning in warnings:
+        logger.warning(warning)
+    logger.info("NOVA backend started", extra={"extra": {"providers_loaded": True}})
+
     print("[*] NOVA AI Chatbot API is starting...")
     print("[*] API available at http://localhost:8000")
     print("[*] API docs at http://localhost:8000/docs")

@@ -9,3 +9,7 @@ anthropic
 python-dotenv
 websockets
 httpx
+groq
+slowapi
+chromadb
+sentence-transformers
