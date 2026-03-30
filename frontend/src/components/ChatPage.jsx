@@ -1,6 +1,15 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Send, Trash2, AlertCircle, Settings2 } from "lucide-react";
+import {
+	Send,
+	Trash2,
+	AlertCircle,
+	Settings2,
+	Mic,
+	Square,
+	Volume2,
+	VolumeX,
+} from "lucide-react";
 import { toast } from "react-hot-toast";
 import MessageBubble from "./MessageBubble";
 import TypingIndicator from "./TypingIndicator";
@@ -30,11 +39,18 @@ export default function ChatPage({ backendOnline }) {
 	const [runtimeMode, setRuntimeMode] = useState("local");
 	const [providerDiagnostics, setProviderDiagnostics] = useState(null);
 	const [responseStyle, setResponseStyle] = useState("balanced");
+	const [isRecording, setIsRecording] = useState(false);
+	const [speechRecognitionSupported, setSpeechRecognitionSupported] =
+		useState(false);
+	const [ttsSupported, setTtsSupported] = useState(false);
+	const [ttsEnabled, setTtsEnabled] = useState(true);
 	const messagesEndRef = useRef(null);
 	const inputRef = useRef(null);
 	const abortRef = useRef(null);
 	const prevProviderRef = useRef(null);
 	const prevCooldownRef = useRef(0);
+	const recognitionRef = useRef(null);
+	const lastSpokenMessageIdRef = useRef(null);
 
 	const scrollToBottom = useCallback(() => {
 		messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -46,6 +62,16 @@ export default function ChatPage({ backendOnline }) {
 
 	useEffect(() => {
 		inputRef.current?.focus();
+	}, []);
+
+	useEffect(() => {
+		if (typeof window === "undefined") return;
+		setSpeechRecognitionSupported(
+			"SpeechRecognition" in window || "webkitSpeechRecognition" in window,
+		);
+		setTtsSupported(
+			"speechSynthesis" in window && "SpeechSynthesisUtterance" in window,
+		);
 	}, []);
 
 	useEffect(() => {
@@ -99,6 +125,7 @@ export default function ChatPage({ backendOnline }) {
 		try {
 			const res = await fetch(`${API_URL}/chat`, {
 				method: "POST",
+				credentials: "include",
 				signal: abortRef.current.signal,
 				headers: { "Content-Type": "application/json" },
 				body: JSON.stringify({
@@ -182,6 +209,7 @@ export default function ChatPage({ backendOnline }) {
 		try {
 			await fetch(`${API_URL}/clear`, {
 				method: "POST",
+				credentials: "include",
 				headers: { "Content-Type": "application/json" },
 				body: JSON.stringify({ session_id: sessionId }),
 			});
@@ -204,9 +232,99 @@ export default function ChatPage({ backendOnline }) {
 		}
 	};
 
-	useEffect(() => {
-		return () => abortRef.current?.abort();
+	const stopRecording = useCallback(() => {
+		if (!recognitionRef.current) return;
+		try {
+			recognitionRef.current.stop();
+		} catch {
+			// silent
+		}
+		setIsRecording(false);
+		recognitionRef.current = null;
 	}, []);
+
+	const startRecording = useCallback(() => {
+		if (!speechRecognitionSupported || typeof window === "undefined") return;
+
+		const SpeechRecognitionClass =
+			window.SpeechRecognition || window.webkitSpeechRecognition;
+		if (!SpeechRecognitionClass) return;
+
+		const recognition = new SpeechRecognitionClass();
+		recognition.lang = "en-US";
+		recognition.interimResults = false;
+		recognition.continuous = false;
+
+		recognition.onstart = () => setIsRecording(true);
+
+		recognition.onresult = (event) => {
+			const transcript = Array.from(event.results)
+				.map((result) => result?.[0]?.transcript || "")
+				.join(" ")
+				.trim();
+
+			if (!transcript) return;
+			setInput(transcript);
+			sendMessage(transcript);
+		};
+
+		recognition.onerror = () => {
+			setIsRecording(false);
+		};
+
+		recognition.onend = () => {
+			setIsRecording(false);
+			recognitionRef.current = null;
+		};
+
+		recognitionRef.current = recognition;
+		recognition.start();
+	}, [sendMessage, speechRecognitionSupported]);
+
+	const handleMicClick = useCallback(() => {
+		if (isRecording) {
+			stopRecording();
+			return;
+		}
+		startRecording();
+	}, [isRecording, startRecording, stopRecording]);
+
+	useEffect(() => {
+		return () => {
+			abortRef.current?.abort();
+			stopRecording();
+			if (typeof window !== "undefined" && "speechSynthesis" in window) {
+				window.speechSynthesis.cancel();
+			}
+		};
+	}, []);
+
+	useEffect(() => {
+		if (!ttsSupported || !ttsEnabled || typeof window === "undefined") return;
+		const latest = messages[messages.length - 1];
+		if (!latest || latest.role !== "assistant") return;
+		if (lastSpokenMessageIdRef.current === latest.id) return;
+
+		const cleanText = latest.content?.replace(/[*_`#>\-]/g, " ").trim();
+		if (!cleanText) return;
+
+		window.speechSynthesis.cancel();
+		const utterance = new window.SpeechSynthesisUtterance(cleanText);
+		utterance.rate = 1;
+		utterance.pitch = 1;
+		window.speechSynthesis.speak(utterance);
+		lastSpokenMessageIdRef.current = latest.id;
+	}, [messages, ttsEnabled, ttsSupported]);
+
+	useEffect(() => {
+		if (
+			!ttsEnabled &&
+			typeof window !== "undefined" &&
+			"speechSynthesis" in window
+		) {
+			window.speechSynthesis.cancel();
+		}
+	}, [ttsEnabled]);
 
 	useEffect(() => {
 		if (!providerDiagnostics) return;
@@ -398,7 +516,60 @@ export default function ChatPage({ backendOnline }) {
 							}}
 							disabled={isLoading}
 						/>
+						{ttsSupported && (
+							<button
+								id="chat-speaker-toggle-button"
+								onClick={() => setTtsEnabled((prev) => !prev)}
+								className={`w-11 h-11 rounded-xl flex items-center justify-center flex-shrink-0 transition-all border ${
+									ttsEnabled
+										? "border-white/20 text-zinc-100 hover:bg-white/5"
+										: "border-white/10 text-zinc-500 hover:text-zinc-300"
+								}`}
+								title={
+									ttsEnabled ? "Disable voice output" : "Enable voice output"
+								}
+							>
+								{ttsEnabled ? (
+									<Volume2 className="w-4 h-4" />
+								) : (
+									<VolumeX className="w-4 h-4" />
+								)}
+							</button>
+						)}
+						{speechRecognitionSupported && (
+							<button
+								id="chat-mic-button"
+								onClick={handleMicClick}
+								disabled={isLoading}
+								className={`relative w-11 h-11 rounded-xl flex items-center justify-center flex-shrink-0 transition-all border ${
+									isLoading
+										? "border-white/10 text-zinc-600 cursor-not-allowed"
+										: isRecording
+											? "border-red-500/60 text-red-300 bg-red-500/10"
+											: "border-white/20 text-zinc-100 hover:bg-white/5"
+								}`}
+								title={isRecording ? "Stop voice input" : "Start voice input"}
+							>
+								{isRecording ? (
+									<Square className="w-4 h-4" />
+								) : (
+									<Mic className="w-4 h-4" />
+								)}
+								{isRecording && (
+									<motion.span
+										className="absolute -top-1 -right-1 w-2.5 h-2.5 rounded-full bg-red-500"
+										animate={{ scale: [1, 1.35, 1], opacity: [1, 0.5, 1] }}
+										transition={{
+											duration: 1,
+											repeat: Infinity,
+											ease: "easeInOut",
+										}}
+									/>
+								)}
+							</button>
+						)}
 						<button
+							id="chat-send-button"
 							onClick={() => sendMessage()}
 							disabled={!input.trim() || isLoading || input.length > 2000}
 							className={`w-11 h-11 rounded-xl flex items-center justify-center flex-shrink-0 transition-all ${

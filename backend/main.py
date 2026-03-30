@@ -4,7 +4,7 @@ FastAPI server with NLP pipeline, session memory, and LLM integration.
 Run with: uvicorn main:app --reload
 """
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -28,7 +28,11 @@ from memory import (
     get_memory_length,
     clear_session,
     get_all_sessions,
+    link_session_to_user,
 )
+from db import get_db, init_db
+from auth import router as auth_router, resolve_user_from_request
+from sqlalchemy.orm import Session
 from nlp_pipeline import run_full_pipeline
 from vector_memory import upsert_exchange, query_similar_exchanges
 from llm_handler import (
@@ -76,6 +80,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(auth_router)
 
 
 # ── Request/Response Models ─────────────────────────────────────────────────
@@ -188,7 +193,7 @@ async def provider_debug():
 
 @app.post("/chat", response_model=ChatResponse)
 @limiter.limit("30/minute")
-async def chat(request: Request, body: ChatRequest):
+async def chat(request: Request, body: ChatRequest, db: Session = Depends(get_db)):
     """
     Main chat endpoint.
     1. Run NLP pipeline on user message
@@ -201,7 +206,11 @@ async def chat(request: Request, body: ChatRequest):
     request_id = str(uuid.uuid4())[:8]
     start_time = time.time()
 
-    session_id = get_or_create_session(body.session_id)
+    user = resolve_user_from_request(request, db)
+    user_id = user.id if user else None
+    session_id = get_or_create_session(body.session_id, user_id=user_id)
+    if user_id is not None:
+        link_session_to_user(session_id, user_id)
     
     # Run NLP pipeline on user message
     nlp_results = await run_full_pipeline(body.message)
@@ -382,6 +391,7 @@ async def websocket_chat(websocket: WebSocket, session_id: str):
 
 @app.on_event("startup")
 async def startup_event():
+    init_db()
     warnings = []
     if not any([os.getenv(f"GEMINI_API_KEY_{i}") for i in range(1, 4)] + [os.getenv("GEMINI_API_KEY")]):
         warnings.append("No Gemini keys found — will use fallback providers")

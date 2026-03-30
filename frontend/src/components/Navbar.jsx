@@ -2,7 +2,7 @@ import { Link, useLocation } from "react-router-dom";
 import { motion } from "framer-motion";
 import { Bot, MessageCircle, BookOpen } from "lucide-react";
 
-export default function Navbar({ backendOnline }) {
+export default function Navbar({ backendOnline, authUser, onOpenAuth }) {
 	const location = useLocation();
 	const navLinks = [
 		{ to: "/", label: "Home", icon: Bot },
@@ -58,15 +58,42 @@ export default function Navbar({ backendOnline }) {
 						})}
 					</div>
 
-					<div className="hidden sm:flex items-center gap-2 text-xs">
-						<div
-							className={`w-2 h-2 rounded-full ${
-								backendOnline ? "bg-emerald-400" : "bg-red-400"
-							}`}
-						/>
-						<span className="text-zinc-500">
-							{backendOnline ? "API Online" : "API Offline"}
-						</span>
+					<div className="hidden sm:flex items-center gap-3 text-xs">
+						<div className="flex items-center gap-2">
+							<div
+								className={`w-2 h-2 rounded-full ${
+									backendOnline ? "bg-emerald-400" : "bg-red-400"
+								}`}
+							/>
+							<span className="text-zinc-500">
+								{backendOnline ? "API Online" : "API Offline"}
+							</span>
+						</div>
+
+						{authUser ? (
+							<div
+								id="navbar-user-chip"
+								className="surface rounded-xl px-2.5 py-1.5 flex items-center gap-2"
+							>
+								<div className="w-6 h-6 rounded-lg bg-white text-black flex items-center justify-center text-[11px] font-semibold uppercase">
+									{(authUser.name || "U").slice(0, 1)}
+								</div>
+								<div className="leading-tight">
+									<div className="text-zinc-200">{authUser.name}</div>
+									<div className="text-[10px] text-zinc-500">
+										{authUser.email}
+									</div>
+								</div>
+							</div>
+						) : (
+							<button
+								id="navbar-open-auth-button"
+								onClick={onOpenAuth}
+								className="surface rounded-xl px-3 py-2 text-zinc-300 hover:text-white"
+							>
+								Login / Register
+							</button>
+						)}
 					</div>
 				</div>
 			</div>

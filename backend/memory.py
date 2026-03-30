@@ -57,11 +57,13 @@ def _prune_sessions() -> None:
             _sessions.pop(sid, None)
 
 
-def get_or_create_session(session_id: Optional[str] = None) -> str:
+def get_or_create_session(session_id: Optional[str] = None, user_id: Optional[int] = None) -> str:
     """Get existing session or create a new one. Returns session_id."""
     _prune_sessions()
 
     if session_id and session_id in _sessions:
+        if user_id is not None:
+            _sessions[session_id]["user_id"] = user_id
         _sessions[session_id]["last_seen_at"] = datetime.now().isoformat()
         return session_id
     
@@ -70,8 +72,18 @@ def get_or_create_session(session_id: Optional[str] = None) -> str:
         "messages": [],
         "created_at": datetime.now().isoformat(),
         "last_seen_at": datetime.now().isoformat(),
+        "user_id": user_id,
     }
     return new_id
+
+
+def link_session_to_user(session_id: str, user_id: int) -> None:
+    """Associate an existing session with a user id."""
+    if session_id not in _sessions:
+        get_or_create_session(session_id, user_id=user_id)
+        return
+    _sessions[session_id]["user_id"] = user_id
+    _sessions[session_id]["last_seen_at"] = datetime.now().isoformat()
 
 
 def add_message(session_id: str, role: str, content: str) -> None:
@@ -124,6 +136,7 @@ def get_all_sessions() -> Dict[str, dict]:
             "message_count": len(data["messages"]),
             "created_at": data["created_at"],
             "last_seen_at": data.get("last_seen_at", data["created_at"]),
+            "user_id": data.get("user_id"),
         }
         for sid, data in _sessions.items()
     }

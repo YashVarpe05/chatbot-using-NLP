@@ -14,3 +14,6 @@ groq
 slowapi
 chromadb
 sentence-transformers
+sqlalchemy
+python-jose[cryptography]
+bcrypt
