@@ -15,6 +15,7 @@ import os
 import time
 import uuid
 import logging
+import asyncio
 
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
@@ -120,6 +121,35 @@ def _build_vector_context(similar: list[dict]) -> str:
     return "\n\n".join(lines)
 
 
+async def _vector_context_for_message(session_id: str, user_message: str, timeout_s: float = 1.2) -> str:
+    """Best-effort vector retrieval that never blocks chat path for long."""
+    try:
+        similar = await asyncio.wait_for(
+            asyncio.to_thread(query_similar_exchanges, session_id, user_message, 3),
+            timeout=timeout_s,
+        )
+        return _build_vector_context(similar)
+    except Exception:
+        return ""
+
+
+async def _vector_upsert_safe(
+    session_id: str,
+    user_message: str,
+    assistant_message: str,
+    timeout_s: float = 1.2,
+) -> bool:
+    """Best-effort vector upsert with timeout guard."""
+    try:
+        await asyncio.wait_for(
+            asyncio.to_thread(upsert_exchange, session_id, user_message, assistant_message),
+            timeout=timeout_s,
+        )
+        return True
+    except Exception:
+        return False
+
+
 # ── REST Endpoints ──────────────────────────────────────────────────────────
 
 @app.get("/")
@@ -181,16 +211,9 @@ async def chat(request: Request, body: ChatRequest):
 
     # Retrieve semantically similar past exchanges (session-scoped)
     history_for_llm = list(history)
-    try:
-        similar = query_similar_exchanges(session_id, body.message, top_k=3)
-        memory_context = _build_vector_context(similar)
-        if memory_context:
-            history_for_llm = [{"role": "assistant", "content": memory_context}] + history_for_llm
-    except Exception as e:
-        logger.warning(
-            "VECTOR_QUERY_FAILED",
-            extra={"extra": {"request_id": request_id, "session_id": session_id, "error": str(e)}},
-        )
+    memory_context = await _vector_context_for_message(session_id, body.message)
+    if memory_context:
+        history_for_llm = [{"role": "assistant", "content": memory_context}] + history_for_llm
     
     # Get LLM response
     reply = await get_llm_response(
@@ -213,12 +236,11 @@ async def chat(request: Request, body: ChatRequest):
     add_message(session_id, "assistant", reply)
 
     # Upsert user-assistant exchange into vector memory (session-scoped)
-    try:
-        upsert_exchange(session_id, body.message, reply)
-    except Exception as e:
+    vector_upsert_ok = await _vector_upsert_safe(session_id, body.message, reply)
+    if not vector_upsert_ok:
         logger.warning(
             "VECTOR_UPSERT_FAILED",
-            extra={"extra": {"request_id": request_id, "session_id": session_id, "error": str(e)}},
+            extra={"extra": {"request_id": request_id, "session_id": session_id, "error": "timeout_or_failure"}},
         )
 
     provider_used = get_provider_diagnostics().get("active_provider", "unknown")
@@ -307,16 +329,9 @@ async def websocket_chat(websocket: WebSocket, session_id: str):
 
             # Retrieve semantically similar past exchanges
             history_for_llm = list(history)
-            try:
-                similar = query_similar_exchanges(session_id, user_message, top_k=3)
-                memory_context = _build_vector_context(similar)
-                if memory_context:
-                    history_for_llm = [{"role": "assistant", "content": memory_context}] + history_for_llm
-            except Exception as e:
-                logger.warning(
-                    "VECTOR_QUERY_FAILED",
-                    extra={"extra": {"session_id": session_id, "error": str(e), "channel": "websocket"}},
-                )
+            memory_context = await _vector_context_for_message(session_id, user_message)
+            if memory_context:
+                history_for_llm = [{"role": "assistant", "content": memory_context}] + history_for_llm
             
             # Generate response
             reply = await get_llm_response(
@@ -335,12 +350,11 @@ async def websocket_chat(websocket: WebSocket, session_id: str):
             # Store in memory
             add_message(session_id, "user", user_message)
             add_message(session_id, "assistant", reply)
-            try:
-                upsert_exchange(session_id, user_message, reply)
-            except Exception as e:
+            vector_upsert_ok = await _vector_upsert_safe(session_id, user_message, reply)
+            if not vector_upsert_ok:
                 logger.warning(
                     "VECTOR_UPSERT_FAILED",
-                    extra={"extra": {"session_id": session_id, "error": str(e), "channel": "websocket"}},
+                    extra={"extra": {"session_id": session_id, "error": "timeout_or_failure", "channel": "websocket"}},
                 )
             
             # Send complete response

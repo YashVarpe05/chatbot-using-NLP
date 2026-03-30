@@ -14,13 +14,16 @@ from sentence_transformers import SentenceTransformer
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _CHROMA_DIR = os.path.join(_HERE, ".chroma")
 _BASE_COLLECTION = "nova_memory"
-_EMBED_MODEL = "all-MiniLM-L6-v2"
+_EMBED_MODEL = os.getenv("VECTOR_EMBED_MODEL", "all-MiniLM-L6-v2")
+_VECTOR_ENABLED = os.getenv("VECTOR_MEMORY_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
 
 _client = None
 _embedder = None
 
 
 def _get_client():
+    if not _VECTOR_ENABLED:
+        raise RuntimeError("Vector memory is disabled")
     global _client
     if _client is None:
         os.makedirs(_CHROMA_DIR, exist_ok=True)
@@ -29,6 +32,8 @@ def _get_client():
 
 
 def _get_embedder() -> SentenceTransformer:
+    if not _VECTOR_ENABLED:
+        raise RuntimeError("Vector memory is disabled")
     global _embedder
     if _embedder is None:
         _embedder = SentenceTransformer(_EMBED_MODEL)
