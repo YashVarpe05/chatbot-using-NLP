@@ -1,165 +1,409 @@
-"""
-LLM Handler for NOVA Chatbot.
-Supports both OpenAI and Anthropic APIs.
-Builds prompts with conversation history for context-aware responses.
-"""
+"""LLM routing + resilient local fallback for NOVA."""
 
+import asyncio
+import itertools
+import json
 import os
-from typing import List, Dict, Optional
+import time
+from typing import Any, Dict, List
+
+import httpx
 from dotenv import load_dotenv
 
+# Load .env from backend directory first
+_HERE = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(_HERE, ".env"))
 load_dotenv()
 
-SYSTEM_PROMPT = """You are NOVA (Neural Optimized Virtual Assistant), an advanced AI assistant built for intelligent conversation. You are:
+SYSTEM_PROMPT = """You are NOVA, an enterprise-grade AI copilot.
 
-- Highly knowledgeable and articulate
-- Concise but thorough in your responses  
-- Context-aware — you remember and reference earlier parts of the conversation
-- Friendly yet professional in tone
-- Capable of explaining complex topics clearly
+Rules:
+1) Be accurate, practical, and concise by default.
+2) Structure answers with short headings and bullets when useful.
+3) If a request is ambiguous, state assumptions briefly.
+4) Never fabricate facts; say what you are unsure about.
+5) Keep tone professional and modern.
+"""
 
-You were created as a showcase of advanced NLP and AI capabilities. When asked about yourself, explain that you combine sentiment analysis, intent detection, named entity recognition, and large language model reasoning.
+STYLE_INSTRUCTIONS = {
+    "concise": "Respond in 4-7 short lines. Prioritize direct action.",
+    "balanced": "Respond with clarity and moderate detail using bullets.",
+    "deep": "Respond with a deeper, step-by-step explanation and best practices.",
+}
 
-Always respond helpfully and intelligently. Keep responses focused and under 200 words unless a detailed explanation is requested."""
+_raw_keys = [
+    os.getenv("GEMINI_API_KEY"),
+    os.getenv("GEMINI_API_KEY_1"),
+    os.getenv("GEMINI_API_KEY_2"),
+    os.getenv("GEMINI_API_KEY_3"),
+]
+GEMINI_KEYS = list(dict.fromkeys([k for k in _raw_keys if k and "your_" not in k]))
+_key_cycle = itertools.cycle(GEMINI_KEYS) if GEMINI_KEYS else None
+_key_cooldowns: Dict[str, float] = {}
+
+_LAST_ACTIVE_PROVIDER = "local"
+_LAST_ERROR = ""
+_GEMINI_WORKING_MODEL: str | None = None
+_OLLAMA_AVAILABLE_LAST = False
 
 
-def _get_provider() -> str:
-    return os.getenv("API_PROVIDER", "openai").lower()
+async def call_with_timeout(coro, timeout: int = 15):
+    try:
+        return await asyncio.wait_for(coro, timeout=timeout)
+    except asyncio.TimeoutError:
+        raise Exception("TIMEOUT")
 
 
-def _build_messages(history: List[Dict], user_message: str) -> List[Dict]:
-    """Build message list with system prompt + conversation history."""
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    
+def _update_diagnostics(provider: str, error: str | None = None) -> None:
+    global _LAST_ACTIVE_PROVIDER, _LAST_ERROR
+    _LAST_ACTIVE_PROVIDER = provider
+    _LAST_ERROR = error or ""
+
+
+def get_next_gemini_key() -> str | None:
+    if not GEMINI_KEYS or _key_cycle is None:
+        return None
+    for _ in range(len(GEMINI_KEYS)):
+        key = next(_key_cycle)
+        if time.time() > _key_cooldowns.get(key, 0):
+            return key
+    return None
+
+
+def set_key_cooldown(key: str, seconds: int = 90) -> None:
+    _key_cooldowns[key] = time.time() + seconds
+
+
+def _gemini_keys_available_count() -> int:
+    now = time.time()
+    return sum(1 for k in GEMINI_KEYS if now > _key_cooldowns.get(k, 0))
+
+
+async def _is_ollama_available() -> bool:
+    global _OLLAMA_AVAILABLE_LAST
+    try:
+        async with httpx.AsyncClient(timeout=2.5) as client:
+            r = await client.get("http://localhost:11434/api/tags")
+            _OLLAMA_AVAILABLE_LAST = r.status_code == 200
+            return _OLLAMA_AVAILABLE_LAST
+    except Exception:
+        _OLLAMA_AVAILABLE_LAST = False
+        return False
+
+
+def get_runtime_mode() -> str:
+    if GEMINI_KEYS and _gemini_keys_available_count() > 0:
+        return "llm"
+    if os.getenv("GROQ_API_KEY", ""):
+        return "llm"
+    return "local"
+
+
+def get_provider_diagnostics() -> Dict[str, Any]:
+    return {
+        "active_provider": _LAST_ACTIVE_PROVIDER,
+        "gemini_keys_total": len(GEMINI_KEYS),
+        "gemini_keys_available": _gemini_keys_available_count(),
+        "groq_available": bool(os.getenv("GROQ_API_KEY", "")),
+        "ollama_available": _OLLAMA_AVAILABLE_LAST,
+        "last_error": _LAST_ERROR,
+        "runtime_mode": get_runtime_mode(),
+        "gemini": {
+            "working_model": _GEMINI_WORKING_MODEL,
+            "cooldown_seconds": max(
+                [0] + [int(v - time.time()) for v in _key_cooldowns.values() if v > time.time()]
+            ),
+            "last_error": _LAST_ERROR,
+        },
+    }
+
+
+def _build_nlp_context(nlp_results: Dict[str, Any] | None) -> str:
+    sentiment = (nlp_results or {}).get("sentiment", {})
+    intent = (nlp_results or {}).get("intent", {})
+    entities = (nlp_results or {}).get("entities", [])
+    entity_summary = ", ".join([f"{e.get('text')} ({e.get('label')})" for e in entities[:5]]) or "none"
+    return (
+        "[NLP Analysis]\n"
+        f"Sentiment: {sentiment.get('label', 'unknown')} ({sentiment.get('compound', 0.0)})\n"
+        f"Intent: {intent.get('top_intent', 'unknown')} ({intent.get('confidence', 0.0):.0%})\n"
+        f"Entities: {entity_summary}"
+    )
+
+
+def _build_messages(
+    history: List[Dict[str, Any]],
+    user_message: str,
+    response_style: str,
+    nlp_results: Dict[str, Any] | None = None,
+) -> List[Dict[str, str]]:
+    style_prompt = STYLE_INSTRUCTIONS.get(response_style, STYLE_INSTRUCTIONS["balanced"])
+    messages: List[Dict[str, str]] = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": _build_nlp_context(nlp_results)},
+        {"role": "system", "content": f"Response style: {style_prompt}"},
+    ]
     for msg in history:
-        messages.append({
-            "role": msg["role"],
-            "content": msg["content"],
-        })
-    
+        messages.append({"role": msg["role"], "content": msg["content"]})
     messages.append({"role": "user", "content": user_message})
     return messages
 
 
+async def _call_gemini(
+    user_message: str,
+    history: List[Dict[str, Any]],
+    nlp_results: Dict[str, Any],
+    response_style: str,
+    temperature: float,
+    api_key: str,
+) -> str:
+    global _GEMINI_WORKING_MODEL
+    messages = _build_messages(history, user_message, response_style, nlp_results)
+    text_prompt = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in messages])
+    requested_model = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+    candidate_models = [m for m in dict.fromkeys([_GEMINI_WORKING_MODEL, requested_model, "gemini-1.5-flash", "gemini-1.5-flash-latest"]) if m]
+
+    payload = {
+        "contents": [{"parts": [{"text": text_prompt}]}],
+        "generationConfig": {
+            "temperature": max(0.0, min(temperature, 1.0)),
+            "maxOutputTokens": 800,
+        },
+    }
+    async with httpx.AsyncClient(timeout=35.0) as client:
+        for model in candidate_models:
+            for base in ["v1beta", "v1"]:
+                url = f"https://generativelanguage.googleapis.com/{base}/models/{model}:generateContent?key={api_key}"
+                resp = await client.post(url, json=payload)
+                if resp.status_code == 404:
+                    continue
+                if resp.status_code == 429:
+                    raise RuntimeError("429 Gemini quota/rate limit")
+                resp.raise_for_status()
+                data = resp.json()
+                parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+                text = "".join([p.get("text", "") for p in parts]).strip()
+                if text:
+                    _GEMINI_WORKING_MODEL = model
+                    return text
+    raise RuntimeError("Gemini returned empty response")
+
+
+def _call_groq_sync(messages: List[Dict[str, str]]) -> str:
+    from groq import Groq
+
+    client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=messages,
+        max_tokens=1024,
+    )
+    return (response.choices[0].message.content or "").strip()
+
+
+async def _call_groq(
+    user_message: str,
+    history: List[Dict[str, Any]],
+    nlp_results: Dict[str, Any],
+    response_style: str,
+) -> str:
+    messages = _build_messages(history, user_message, response_style, nlp_results)
+    return await asyncio.to_thread(_call_groq_sync, messages)
+
+
+async def _call_ollama(
+    user_message: str,
+    history: List[Dict[str, Any]],
+    nlp_results: Dict[str, Any],
+    response_style: str,
+) -> str:
+    payload = {
+        "model": "qwen2.5-coder:7b",
+        "messages": _build_messages(history, user_message, response_style, nlp_results),
+        "stream": False,
+    }
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post("http://localhost:11434/api/chat", json=payload)
+        resp.raise_for_status()
+        return (resp.json().get("message", {}).get("content", "") or "").strip()
+
+
+def _smart_template_response(user_message: str, nlp_results: Dict[str, Any]) -> str:
+    msg = user_message.strip()
+    lower = msg.lower()
+    intent = nlp_results.get("intent", {}).get("top_intent", "unknown")
+
+    if intent == "greeting" or any(w in lower for w in ["hello", "hi", "hey"]):
+        return "Hey! I’m NOVA. I can help with setup guides, debugging, architecture, and code generation."
+
+    if "mongodb" in lower and any(k in lower for k in ["setup", "set up", "install", "configure"]):
+        return (
+            "To set up MongoDB on a new device:\n"
+            "1) Download MongoDB Community Server from mongodb.com/try/download/community\n"
+            "2) Install it and enable MongoDB service during setup\n"
+            "3) Add MongoDB `bin` to PATH (`mongod`, `mongosh`)\n"
+            "4) Start service (Windows Services / Linux `sudo systemctl start mongod`)\n"
+            "5) Connect with MongoDB Compass or `mongosh`\n\n"
+            "Node.js quick start:\n"
+            "- `npm install mongoose`\n"
+            "- `mongoose.connect(\"mongodb://127.0.0.1:27017/yourdb\")`"
+        )
+
+    if any(k in lower for k in ["linked list", "what is a linked list"]):
+        return (
+            "A linked list is a linear data structure where each node stores data and a pointer to the next node.\n"
+            "It supports efficient insert/delete (especially in middle) but slower random access than arrays."
+        )
+
+    if any(k in lower for k in ["calculator in c", "create a calculator in c", "c calculator"]):
+        return (
+            "Here is a basic C calculator skeleton:\n\n"
+            "```c\n"
+            "#include <stdio.h>\n\n"
+            "int main() {\n"
+            "    double a, b;\n"
+            "    char op;\n"
+            "    // 1) Read first number\n"
+            "    // 2) Read operator (+, -, *, /)\n"
+            "    // 3) Read second number\n"
+            "    // 4) Compute using switch(op)\n"
+            "    // 5) Print result\n"
+            "    return 0;\n"
+            "}\n"
+            "```"
+        )
+
+    if intent in ["command", "request"] or any(k in lower for k in ["how to", "setup", "install", "configure", "steps"]):
+        return (
+            f"Step-by-step plan for: {msg}\n"
+            "1) Confirm prerequisites/tools\n"
+            "2) Install or configure core components\n"
+            "3) Verify with a small test command\n"
+            "4) Add optional integration (API/app layer)\n"
+            "5) Document and automate with scripts"
+        )
+
+    if intent == "question" or lower.endswith("?"):
+        return (
+            f"Direct answer: {msg}\n"
+            "If you want, I can also provide a concise version, a deep explanation, or a practical example."
+        )
+
+    if any(k in lower for k in ["code", "program", "function", "snippet"]):
+        return (
+            "Code starter template:\n"
+            "1) Define inputs and expected output\n"
+            "2) Add validation checks\n"
+            "3) Implement core logic in a reusable function\n"
+            "4) Add sample test cases"
+        )
+
+    return (
+        "Got it. Share your target output format (code/plan/summary), constraints, and language, "
+        "and I’ll generate a production-ready first draft."
+    )
+
+
 async def get_llm_response(
     user_message: str,
-    history: List[Dict],
+    history: List[Dict[str, Any]],
+    nlp_results: Dict[str, Any],
+    response_style: str = "balanced",
+    temperature: float = 0.4,
 ) -> str:
-    """
-    Get response from LLM API (OpenAI or Anthropic).
-    Falls back to a smart local response if no API key is configured.
-    """
-    provider = _get_provider()
-    
-    # ── Try OpenAI ──────────────────────────────────────────────────
-    if provider == "openai":
-        api_key = os.getenv("OPENAI_API_KEY", "")
-        if api_key and api_key != "your_openai_key_here":
+    # 1) Gemini with key rotation + per-key cooldown
+    if GEMINI_KEYS:
+        for _ in range(len(GEMINI_KEYS)):
+            key = get_next_gemini_key()
+            if not key:
+                break
             try:
-                from openai import AsyncOpenAI
-                client = AsyncOpenAI(api_key=api_key)
-                messages = _build_messages(history, user_message)
-                
-                response = await client.chat.completions.create(
-                    model=os.getenv("OPENAI_MODEL", "gpt-3.5-turbo"),
-                    messages=messages,
-                    max_tokens=500,
-                    temperature=0.7,
+                text = await call_with_timeout(
+                    _call_gemini(
+                        user_message=user_message,
+                        history=history,
+                        nlp_results=nlp_results,
+                        response_style=response_style,
+                        temperature=temperature,
+                        api_key=key,
+                    ),
+                    timeout=15,
                 )
-                return response.choices[0].message.content
+                _update_diagnostics("gemini", None)
+                return text
             except Exception as e:
-                print(f"⚠️  OpenAI API error: {e}")
-    
-    # ── Try Anthropic ───────────────────────────────────────────────
-    elif provider == "anthropic":
-        api_key = os.getenv("ANTHROPIC_API_KEY", "")
-        if api_key and api_key != "your_anthropic_key_here":
-            try:
-                import anthropic
-                client = anthropic.AsyncAnthropic(api_key=api_key)
-                
-                # Build messages without system (Anthropic handles it separately)
-                msgs = []
-                for msg in history:
-                    msgs.append({
-                        "role": msg["role"],
-                        "content": msg["content"],
-                    })
-                msgs.append({"role": "user", "content": user_message})
-                
-                response = await client.messages.create(
-                    model=os.getenv("ANTHROPIC_MODEL", "claude-3-haiku-20240307"),
-                    max_tokens=500,
-                    system=SYSTEM_PROMPT,
-                    messages=msgs,
-                )
-                return response.content[0].text
-            except Exception as e:
-                print(f"⚠️  Anthropic API error: {e}")
-    
-    # ── Fallback: Smart local response ──────────────────────────────
-    return _generate_local_response(user_message, history)
+                err = str(e)
+                if "429" in err or "quota" in err.lower() or "rate limit" in err.lower():
+                    set_key_cooldown(key, 90)
+                    _update_diagnostics("gemini", err)
+                    continue
+                if "TIMEOUT" in err:
+                    _update_diagnostics("gemini", "TIMEOUT")
+                    continue
+                _update_diagnostics("gemini", err)
+                break
+
+    # 2) Groq fallback
+    if os.getenv("GROQ_API_KEY", ""):
+        try:
+            text = await call_with_timeout(
+                _call_groq(user_message, history, nlp_results, response_style),
+                timeout=15,
+            )
+            if text:
+                _update_diagnostics("groq", None)
+                return text
+        except Exception as e:
+            _update_diagnostics("groq", str(e))
+
+    # 3) Ollama fallback
+    try:
+        if await _is_ollama_available():
+            text = await call_with_timeout(
+                _call_ollama(user_message, history, nlp_results, response_style),
+                timeout=15,
+            )
+            if text:
+                _update_diagnostics("ollama", None)
+                return text
+    except Exception as e:
+        _update_diagnostics("ollama", str(e))
+
+    # 4) Smart Template fallback (guaranteed)
+    _update_diagnostics("local", None)
+    return _smart_template_response(user_message, nlp_results)
 
 
-def _generate_local_response(user_message: str, history: List[Dict]) -> str:
-    """
-    Generate an intelligent local response without an LLM API.
-    This provides a great demo experience even without API keys.
-    """
-    msg_lower = user_message.lower().strip()
-    turn_count = len(history) // 2 + 1
-    
-    # Greeting responses
-    greetings = ["hello", "hi", "hey", "greetings", "good morning", "good evening", "good afternoon"]
-    if any(g in msg_lower for g in greetings):
-        responses = [
-            f"Hello! I'm NOVA, your Neural Optimized Virtual Assistant. This is turn {turn_count} of our conversation. How can I help you today?",
-            f"Hey there! Welcome to NOVA. I'm an AI assistant powered by advanced NLP — I can analyze sentiment, detect intents, and recognize named entities in real-time. What would you like to explore?",
-            f"Hi! Great to see you. I'm NOVA — check out the NLP panel on the right to see real-time analysis of our conversation. What's on your mind?",
-        ]
-        return responses[turn_count % len(responses)]
-    
-    # Questions about NOVA
-    if any(w in msg_lower for w in ["who are you", "what are you", "about you", "your name", "what can you do"]):
-        return ("I'm NOVA — Neural Optimized Virtual Assistant. I'm a showcase of modern NLP capabilities:\n\n"
-                "🔹 **Sentiment Analysis** — I analyze the emotional tone of your messages using VADER\n"
-                "🔹 **Intent Detection** — I classify your intent using zero-shot learning (BART-MNLI)\n"  
-                "🔹 **Named Entity Recognition** — I identify people, organizations, places, and dates using spaCy\n"
-                "🔹 **Context Memory** — I remember our last 10 conversation turns\n\n"
-                "Try mentioning a person, company, or place — watch the NLP panel light up!")
-    
-    # Questions about NLP
-    if any(w in msg_lower for w in ["sentiment", "nlp", "entity", "intent", "ner", "natural language"]):
-        return ("Great question! Here's what's happening behind the scenes:\n\n"
-                "📊 **Sentiment Analysis (VADER)** scores your message from -1 (negative) to +1 (positive)\n"
-                "🎯 **Intent Detection** uses Facebook's BART-MNLI model for zero-shot classification\n"
-                "🏷️ **Named Entity Recognition** uses spaCy's transformer pipeline to find entities\n\n"
-                f"I'm currently remembering {turn_count} turns of our conversation. "
-                "Check the right panel to see all these analyses in real-time!")
-    
-    # Farewell
-    if any(w in msg_lower for w in ["bye", "goodbye", "see you", "farewell", "quit", "exit"]):
-        return f"Goodbye! It was great chatting with you over {turn_count} turns. Feel free to come back anytime! 👋"
-    
-    # Thank you
-    if any(w in msg_lower for w in ["thank", "thanks", "appreciate"]):
-        return "You're welcome! I'm here to help. Feel free to ask me anything — and keep an eye on the NLP panel to see how I analyze each message! 🚀"
-    
-    # Help
-    if any(w in msg_lower for w in ["help", "how to", "guide"]):
-        return ("Here are some things you can try to see NOVA's NLP capabilities:\n\n"
-                "💬 **Mention entities**: 'Tell me about Google's office in New York'\n"
-                "😊 **Express emotion**: 'I'm really happy today!' or 'This is frustrating'\n"
-                "❓ **Ask questions**: 'What is machine learning?'\n"
-                "👋 **Greetings/Farewells**: 'Hello!' or 'Goodbye!'\n"
-                "📝 **Give commands**: 'Summarize the key NLP techniques'\n\n"
-                "Watch the NLP panel update in real-time with each message!")
-    
-    # Default intelligent response
-    context_note = f" (I've been tracking our conversation for {turn_count} turns)" if turn_count > 1 else ""
-    
-    return (f"That's an interesting message{context_note}! I've analyzed it with my NLP pipeline — "
-            f"check the panel on the right to see the sentiment score, detected intent, and any named entities I found.\n\n"
-            f"💡 **Tip**: Try mentioning specific people (like 'Elon Musk'), organizations (like 'NASA'), "
-            f"or places (like 'Tokyo') to see entity recognition in action!\n\n"
-            f"I'm running in local mode — connect an OpenAI or Anthropic API key in the .env file for full LLM-powered responses.")
+def _default_followups() -> List[str]:
+    return [
+        "Can you simplify this?",
+        "Show me a practical example",
+        "What should I do next?",
+    ]
+
+
+async def generate_followups(
+    llm_response_text: str,
+    history: List[Dict[str, Any]],
+    response_style: str,
+    nlp_results: Dict[str, Any],
+) -> List[str]:
+    prompt = (
+        "Generate exactly 3 short follow-up questions based on this assistant response. "
+        "Return ONLY a JSON array of 3 strings.\n\n"
+        f"Response:\n{llm_response_text}"
+    )
+    try:
+        text = await get_llm_response(
+            user_message=prompt,
+            history=history,
+            nlp_results=nlp_results,
+            response_style="concise",
+            temperature=0.2,
+        )
+        parsed = json.loads(text)
+        if isinstance(parsed, list) and len(parsed) >= 3:
+            return [str(x) for x in parsed[:3]]
+    except Exception:
+        pass
+    return _default_followups()

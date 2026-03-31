@@ -1,3 +1,4 @@
+
 fastapi
 uvicorn[standard]
 spacy
@@ -9,3 +10,10 @@ anthropic
 python-dotenv
 websockets
 httpx
+groq
+slowapi
+chromadb
+sentence-transformers
+sqlalchemy
+python-jose[cryptography]
+bcrypt

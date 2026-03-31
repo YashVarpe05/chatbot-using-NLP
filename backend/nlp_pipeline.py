@@ -4,6 +4,7 @@ Performs: Sentiment Analysis (VADER), Intent Detection (zero-shot), NER (spaCy).
 All models run locally — no cloud NLP APIs needed.
 """
 
+import asyncio
 import spacy
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from transformers import pipeline
@@ -146,15 +147,33 @@ def extract_entities(text: str) -> List[Dict[str, str]]:
     return entities
 
 
-# ── Full Pipeline ───────────────────────────────────────────────────────────
+async def detect_intent_safe(text: str) -> Dict[str, Any]:
+    try:
+        loop = asyncio.get_running_loop()
+        return await asyncio.wait_for(
+            loop.run_in_executor(None, detect_intent, text),
+            timeout=5.0,
+        )
+    except asyncio.TimeoutError:
+        return {
+            "top_intent": "unknown",
+            "confidence": 0.0,
+            "all_intents": {},
+        }
+    except Exception:
+        return {
+            "top_intent": "unknown",
+            "confidence": 0.0,
+            "all_intents": {},
+        }
 
-def run_full_pipeline(text: str) -> Dict[str, Any]:
+
+async def run_full_pipeline(text: str) -> Dict[str, Any]:
     """
-    Run the complete NLP pipeline on a message.
-    Returns sentiment, intent, and entities.
+    Async-safe full pipeline with timeout-protected intent detection.
     """
     return {
         "sentiment": analyze_sentiment(text),
-        "intent": detect_intent(text),
+        "intent": await detect_intent_safe(text),
         "entities": extract_entities(text),
     }
