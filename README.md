@@ -1,4 +1,4 @@
-# NOVA — Neural Optimized Virtual Assistant
+`# NOVA — Neural Optimized Virtual Assistant
 
 NOVA is an advanced AI chatbot built with a FastAPI backend and a React frontend, designed for production-style behavior with NLP enrichment and multi-provider LLM fallback routing. It combines conversation memory, sentiment/intent/entity analysis, and resilient runtime fallback to keep responses available even under provider failures.
 
@@ -39,15 +39,17 @@ NOVA is an advanced AI chatbot built with a FastAPI backend and a React frontend
 4. **Start app**
    - Linux/Mac: `bash start.sh`
    - Windows: `start.bat`
+   - Docker: `docker-compose up -d --build`
 5. **Open app**
-   - Frontend: http://localhost:5173
+   - Frontend (Local): http://localhost:5173
+   - Frontend (Docker): http://localhost:80
 
 ## Provider fallback chain
 
 NOVA tries providers in this order:
 
-1. Gemini (multi-key rotation + per-key cooldown)
-2. Groq (`llama-3.3-70b-versatile`)
+1. Groq (`llama-3.3-70b-versatile` - fast and free primary)
+2. Gemini (multi-key rotation + per-key cooldown)
 3. Ollama (`qwen2.5-coder:7b`)
 4. Smart local template response (guaranteed final fallback)
 

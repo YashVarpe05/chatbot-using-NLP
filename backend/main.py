@@ -15,7 +15,6 @@ import os
 import time
 import uuid
 import logging
-import asyncio
 
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
@@ -34,7 +33,11 @@ from db import get_db, init_db
 from auth import router as auth_router, resolve_user_from_request
 from sqlalchemy.orm import Session
 from nlp_pipeline import run_full_pipeline
-from vector_memory import upsert_exchange, query_similar_exchanges
+from vector_memory import (
+    delete_session_memory,
+    get_session_memory_count,
+    CHROMA_PATH,
+)
 from llm_handler import (
     get_llm_response,
     generate_followups,
@@ -112,47 +115,8 @@ class ChatResponse(BaseModel):
     followups: list
     runtime_mode: str
     memory_length: int
+    vector_memory_count: int
     session_id: str
-
-
-def _build_vector_context(similar: list[dict]) -> str:
-    if not similar:
-        return ""
-    lines = ["[Relevant Past Exchanges]"]
-    for i, item in enumerate(similar[:3], start=1):
-        doc = (item or {}).get("document", "")
-        if doc:
-            lines.append(f"{i}. {doc}")
-    return "\n\n".join(lines)
-
-
-async def _vector_context_for_message(session_id: str, user_message: str, timeout_s: float = 1.2) -> str:
-    """Best-effort vector retrieval that never blocks chat path for long."""
-    try:
-        similar = await asyncio.wait_for(
-            asyncio.to_thread(query_similar_exchanges, session_id, user_message, 3),
-            timeout=timeout_s,
-        )
-        return _build_vector_context(similar)
-    except Exception:
-        return ""
-
-
-async def _vector_upsert_safe(
-    session_id: str,
-    user_message: str,
-    assistant_message: str,
-    timeout_s: float = 1.2,
-) -> bool:
-    """Best-effort vector upsert with timeout guard."""
-    try:
-        await asyncio.wait_for(
-            asyncio.to_thread(upsert_exchange, session_id, user_message, assistant_message),
-            timeout=timeout_s,
-        )
-        return True
-    except Exception:
-        return False
 
 
 # ── REST Endpoints ──────────────────────────────────────────────────────────
@@ -188,6 +152,8 @@ async def provider_debug():
             "active_sessions": len(sessions),
             "total_messages": total_messages,
         },
+        "rag_enabled": True,
+        "chroma_path": CHROMA_PATH,
     }
 
 
@@ -217,20 +183,15 @@ async def chat(request: Request, body: ChatRequest, db: Session = Depends(get_db
     
     # Get conversation history for context
     history = get_history(session_id)
-
-    # Retrieve semantically similar past exchanges (session-scoped)
-    history_for_llm = list(history)
-    memory_context = await _vector_context_for_message(session_id, body.message)
-    if memory_context:
-        history_for_llm = [{"role": "assistant", "content": memory_context}] + history_for_llm
     
     # Get LLM response
     reply = await get_llm_response(
         user_message=body.message,
-        history=history_for_llm,
+        history=history,
         nlp_results=nlp_results,
         response_style=(body.response_style or "balanced"),
         temperature=body.temperature if body.temperature is not None else 0.4,
+        session_id=session_id,
     )
 
     suggestions = await generate_followups(
@@ -243,14 +204,6 @@ async def chat(request: Request, body: ChatRequest, db: Session = Depends(get_db
     # Store both messages in memory
     add_message(session_id, "user", body.message)
     add_message(session_id, "assistant", reply)
-
-    # Upsert user-assistant exchange into vector memory (session-scoped)
-    vector_upsert_ok = await _vector_upsert_safe(session_id, body.message, reply)
-    if not vector_upsert_ok:
-        logger.warning(
-            "VECTOR_UPSERT_FAILED",
-            extra={"extra": {"request_id": request_id, "session_id": session_id, "error": "timeout_or_failure"}},
-        )
 
     provider_used = get_provider_diagnostics().get("active_provider", "unknown")
     response_time_ms = int((time.time() - start_time) * 1000)
@@ -278,6 +231,7 @@ async def chat(request: Request, body: ChatRequest, db: Session = Depends(get_db
         followups=suggestions,
         runtime_mode=get_runtime_mode(),
         memory_length=get_memory_length(session_id),
+        vector_memory_count=get_session_memory_count(session_id),
         session_id=session_id,
     )
 
@@ -290,6 +244,7 @@ class ClearRequest(BaseModel):
 async def clear_memory(request: ClearRequest):
     """Clear conversation memory for a session."""
     success = clear_session(request.session_id)
+    delete_session_memory(request.session_id)
     return {
         "success": success,
         "message": "Memory cleared" if success else "Session not found",
@@ -335,18 +290,13 @@ async def websocket_chat(websocket: WebSocket, session_id: str):
             
             # Get conversation history
             history = get_history(session_id)
-
-            # Retrieve semantically similar past exchanges
-            history_for_llm = list(history)
-            memory_context = await _vector_context_for_message(session_id, user_message)
-            if memory_context:
-                history_for_llm = [{"role": "assistant", "content": memory_context}] + history_for_llm
             
             # Generate response
             reply = await get_llm_response(
                 user_message=user_message,
-                history=history_for_llm,
+                history=history,
                 nlp_results=nlp_results,
+                session_id=session_id,
             )
 
             suggestions = await generate_followups(
@@ -359,12 +309,6 @@ async def websocket_chat(websocket: WebSocket, session_id: str):
             # Store in memory
             add_message(session_id, "user", user_message)
             add_message(session_id, "assistant", reply)
-            vector_upsert_ok = await _vector_upsert_safe(session_id, user_message, reply)
-            if not vector_upsert_ok:
-                logger.warning(
-                    "VECTOR_UPSERT_FAILED",
-                    extra={"extra": {"session_id": session_id, "error": "timeout_or_failure", "channel": "websocket"}},
-                )
             
             # Send complete response
             await websocket.send_text(json.dumps({
@@ -377,6 +321,7 @@ async def websocket_chat(websocket: WebSocket, session_id: str):
                 "followups": suggestions,
                 "runtime_mode": get_runtime_mode(),
                 "memory_length": get_memory_length(session_id),
+                "vector_memory_count": get_session_memory_count(session_id),
                 "session_id": session_id,
             }))
     
@@ -392,6 +337,7 @@ async def websocket_chat(websocket: WebSocket, session_id: str):
 @app.on_event("startup")
 async def startup_event():
     init_db()
+    logger.info("ChromaDB RAG initialized", extra={"extra": {"chroma_path": CHROMA_PATH}})
     warnings = []
     if not any([os.getenv(f"GEMINI_API_KEY_{i}") for i in range(1, 4)] + [os.getenv("GEMINI_API_KEY")]):
         warnings.append("No Gemini keys found — will use fallback providers")
