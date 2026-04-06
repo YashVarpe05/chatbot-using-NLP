@@ -1,107 +1,151 @@
-"""ChromaDB-backed semantic memory for session-scoped retrieval."""
+"""
+NOVA Vector Memory — RAG layer using ChromaDB
+Stores past conversation pairs as embeddings.
+Retrieves semantically similar context for each new query.
+"""
 
-from __future__ import annotations
-
+import hashlib
 import os
-import re
-import uuid
-from datetime import datetime
-from typing import Any, Dict, List
+import time
 
 import chromadb
+from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_CHROMA_DIR = os.path.join(_HERE, ".chroma")
-_BASE_COLLECTION = "nova_memory"
-_EMBED_MODEL = os.getenv("VECTOR_EMBED_MODEL", "all-MiniLM-L6-v2")
-_VECTOR_ENABLED = os.getenv("VECTOR_MEMORY_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
-
-_client = None
-_embedder = None
+# --- Init embedding model (loads once, cached globally) ---
+_embed_model = None
 
 
-def _get_client():
-    if not _VECTOR_ENABLED:
-        raise RuntimeError("Vector memory is disabled")
-    global _client
-    if _client is None:
-        os.makedirs(_CHROMA_DIR, exist_ok=True)
-        _client = chromadb.PersistentClient(path=_CHROMA_DIR)
-    return _client
+def get_embed_model():
+    global _embed_model
+    if _embed_model is None:
+        _embed_model = SentenceTransformer("all-MiniLM-L6-v2")
+    return _embed_model
 
 
-def _get_embedder() -> SentenceTransformer:
-    if not _VECTOR_ENABLED:
-        raise RuntimeError("Vector memory is disabled")
-    global _embedder
-    if _embedder is None:
-        _embedder = SentenceTransformer(_EMBED_MODEL)
-    return _embedder
+# --- Init ChromaDB (persistent local storage) ---
+CHROMA_PATH = os.path.join(os.path.dirname(__file__), "chroma_store")
+
+_chroma_client = None
 
 
-def _session_collection_name(session_id: str) -> str:
-    safe = re.sub(r"[^a-zA-Z0-9_-]", "_", session_id)[:80]
-    return f"{_BASE_COLLECTION}__{safe}"
-
-
-def _get_collection(session_id: str):
-    client = _get_client()
-    return client.get_or_create_collection(name=_session_collection_name(session_id))
-
-
-def _embed_texts(texts: List[str]) -> List[List[float]]:
-    model = _get_embedder()
-    vectors = model.encode(texts, normalize_embeddings=True)
-    return vectors.tolist()
-
-
-def _build_exchange_text(user_message: str, assistant_message: str) -> str:
-    return f"User: {user_message}\nAssistant: {assistant_message}"
-
-
-def upsert_exchange(session_id: str, user_message: str, assistant_message: str) -> None:
-    """Embed and upsert a single user-assistant exchange into session collection."""
-    text = _build_exchange_text(user_message, assistant_message)
-    vector = _embed_texts([text])[0]
-    collection = _get_collection(session_id)
-
-    doc_id = str(uuid.uuid4())
-    collection.upsert(
-        ids=[doc_id],
-        embeddings=[vector],
-        documents=[text],
-        metadatas=[
-            {
-                "session_id": session_id,
-                "created_at": datetime.utcnow().isoformat(),
-                "type": "exchange",
-            }
-        ],
-    )
-
-
-def query_similar_exchanges(session_id: str, user_message: str, top_k: int = 3) -> List[Dict[str, Any]]:
-    """Return top-k semantically similar past exchanges for a session."""
-    collection = _get_collection(session_id)
-    query_embedding = _embed_texts([user_message])[0]
-    result = collection.query(
-        query_embeddings=[query_embedding],
-        n_results=max(1, top_k),
-        include=["documents", "metadatas", "distances"],
-    )
-
-    documents = (result.get("documents") or [[]])[0]
-    metadatas = (result.get("metadatas") or [[]])[0]
-    distances = (result.get("distances") or [[]])[0]
-
-    matches: List[Dict[str, Any]] = []
-    for idx, doc in enumerate(documents):
-        matches.append(
-            {
-                "document": doc,
-                "metadata": metadatas[idx] if idx < len(metadatas) else {},
-                "distance": distances[idx] if idx < len(distances) else None,
-            }
+def get_chroma_client():
+    global _chroma_client
+    if _chroma_client is None:
+        _chroma_client = chromadb.PersistentClient(
+            path=CHROMA_PATH,
+            settings=Settings(anonymized_telemetry=False),
         )
-    return matches
+    return _chroma_client
+
+
+def get_collection(session_id: str):
+    """Get or create a ChromaDB collection for this session."""
+    client = get_chroma_client()
+    # Collection names must be alphanumeric + underscores
+    safe_name = "nova_" + session_id.replace("-", "_")
+    return client.get_or_create_collection(
+        name=safe_name,
+        metadata={"hnsw:space": "cosine"},
+    )
+
+
+# --- Core RAG functions ---
+
+def store_exchange(session_id: str, user_message: str, assistant_response: str):
+    """
+    Embed and store a conversation exchange in ChromaDB.
+    Called AFTER every successful LLM response.
+    """
+    try:
+        collection = get_collection(session_id)
+        model = get_embed_model()
+
+        # Combine user + assistant for richer embedding context
+        combined_text = f"User: {user_message}\nAssistant: {assistant_response}"
+        embedding = model.encode(combined_text).tolist()
+
+        # Unique ID: hash of session + timestamp
+        doc_id = hashlib.md5(
+            f"{session_id}_{time.time()}".encode()
+        ).hexdigest()
+
+        collection.add(
+            ids=[doc_id],
+            embeddings=[embedding],
+            documents=[combined_text],
+            metadatas=[{
+                "session_id": session_id,
+                "timestamp": time.time(),
+                "user_message": user_message[:500],
+                "assistant_preview": assistant_response[:500],
+            }],
+        )
+    except Exception as e:
+        # RAG store failure must never crash the main chat flow
+        print(f"[vector_memory] store_exchange error: {e}")
+
+
+def retrieve_similar(session_id: str, query: str, top_k: int = 3) -> list[dict]:
+    """
+    Find top_k most semantically similar past exchanges for this session.
+    Returns list of dicts with 'user_message', 'assistant_preview', 'score'.
+    Called BEFORE LLM to inject relevant memory.
+    """
+    try:
+        collection = get_collection(session_id)
+
+        # Need at least 1 stored document to query
+        if collection.count() == 0:
+            return []
+
+        model = get_embed_model()
+        query_embedding = model.encode(query).tolist()
+
+        results = collection.query(
+            query_embeddings=[query_embedding],
+            n_results=min(top_k, collection.count()),
+            include=["documents", "metadatas", "distances"],
+        )
+
+        similar = []
+        for i, doc in enumerate(results["documents"][0]):
+            distance = results["distances"][0][i]
+            score = 1 - distance  # cosine similarity (higher = more similar)
+
+            # Only include if similarity is meaningful (>0.3)
+            if score > 0.3:
+                similar.append({
+                    "document": doc,
+                    "user_message": results["metadatas"][0][i].get("user_message", ""),
+                    "assistant_preview": results["metadatas"][0][i].get("assistant_preview", ""),
+                    "score": round(score, 3),
+                })
+
+        return similar
+
+    except Exception as e:
+        print(f"[vector_memory] retrieve_similar error: {e}")
+        return []
+
+
+def delete_session_memory(session_id: str):
+    """
+    Delete all vector memory for a session.
+    Called when POST /clear is triggered.
+    """
+    try:
+        client = get_chroma_client()
+        safe_name = "nova_" + session_id.replace("-", "_")
+        client.delete_collection(safe_name)
+    except Exception as e:
+        print(f"[vector_memory] delete_session_memory error: {e}")
+
+
+def get_session_memory_count(session_id: str) -> int:
+    """Return how many exchanges are stored for this session."""
+    try:
+        collection = get_collection(session_id)
+        return collection.count()
+    except Exception:
+        return 0

@@ -150,6 +150,7 @@ export default function ChatPage({ backendOnline }) {
 				sentiment: data.sentiment,
 				intent: data.intent,
 				entities: data.entities,
+				vector_memory_count: data.vector_memory_count || 0,
 			});
 			setMemoryLength(data.memory_length);
 			if (data.session_id && data.session_id !== sessionId) {

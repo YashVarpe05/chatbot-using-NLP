@@ -9,6 +9,7 @@ from typing import Any, Dict, List
 
 import httpx
 from dotenv import load_dotenv
+from vector_memory import retrieve_similar, store_exchange
 
 # Load .env from backend directory first
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -136,13 +137,14 @@ def _build_messages(
     user_message: str,
     response_style: str,
     nlp_results: Dict[str, Any] | None = None,
+    rag_context: str = "",
 ) -> List[Dict[str, str]]:
     style_prompt = STYLE_INSTRUCTIONS.get(response_style, STYLE_INSTRUCTIONS["balanced"])
-    messages: List[Dict[str, str]] = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "system", "content": _build_nlp_context(nlp_results)},
-        {"role": "system", "content": f"Response style: {style_prompt}"},
-    ]
+    messages: List[Dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    if rag_context:
+        messages.append({"role": "system", "content": rag_context})
+    messages.append({"role": "system", "content": _build_nlp_context(nlp_results)})
+    messages.append({"role": "system", "content": f"Response style: {style_prompt}"})
     for msg in history:
         messages.append({"role": msg["role"], "content": msg["content"]})
     messages.append({"role": "user", "content": user_message})
@@ -156,9 +158,10 @@ async def _call_gemini(
     response_style: str,
     temperature: float,
     api_key: str,
+    rag_context: str,
 ) -> str:
     global _GEMINI_WORKING_MODEL
-    messages = _build_messages(history, user_message, response_style, nlp_results)
+    messages = _build_messages(history, user_message, response_style, nlp_results, rag_context)
     text_prompt = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in messages])
     requested_model = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
     candidate_models = [m for m in dict.fromkeys([_GEMINI_WORKING_MODEL, requested_model, "gemini-1.5-flash", "gemini-1.5-flash-latest"]) if m]
@@ -206,8 +209,9 @@ async def _call_groq(
     history: List[Dict[str, Any]],
     nlp_results: Dict[str, Any],
     response_style: str,
+    rag_context: str,
 ) -> str:
-    messages = _build_messages(history, user_message, response_style, nlp_results)
+    messages = _build_messages(history, user_message, response_style, nlp_results, rag_context)
     return await asyncio.to_thread(_call_groq_sync, messages)
 
 
@@ -216,10 +220,11 @@ async def _call_ollama(
     history: List[Dict[str, Any]],
     nlp_results: Dict[str, Any],
     response_style: str,
+    rag_context: str,
 ) -> str:
     payload = {
         "model": "qwen2.5-coder:7b",
-        "messages": _build_messages(history, user_message, response_style, nlp_results),
+        "messages": _build_messages(history, user_message, response_style, nlp_results, rag_context),
         "stream": False,
     }
     async with httpx.AsyncClient(timeout=30.0) as client:
@@ -310,8 +315,33 @@ async def get_llm_response(
     nlp_results: Dict[str, Any],
     response_style: str = "balanced",
     temperature: float = 0.4,
+    session_id: str = "default",
 ) -> str:
-    # 1) Gemini with key rotation + per-key cooldown
+    # Retrieve semantically similar past exchanges
+    similar_context = retrieve_similar(session_id, user_message, top_k=3)
+
+    rag_context = ""
+    if similar_context:
+        rag_context = "\n\n[Relevant past context from memory:]\n"
+        for item in similar_context:
+            rag_context += f"- {item['document'][:300]}\n"
+            rag_context += f"  (similarity: {item['score']})\n"
+
+    # 1) Groq as Primary
+    if os.getenv("GROQ_API_KEY", ""):
+        try:
+            text = await call_with_timeout(
+                _call_groq(user_message, history, nlp_results, response_style, rag_context),
+                timeout=15,
+            )
+            if text:
+                _update_diagnostics("groq", None)
+                store_exchange(session_id, user_message, text)
+                return text
+        except Exception as e:
+            _update_diagnostics("groq", str(e))
+
+    # 2) Gemini with key rotation + per-key cooldown
     if GEMINI_KEYS:
         for _ in range(len(GEMINI_KEYS)):
             key = get_next_gemini_key()
@@ -326,10 +356,12 @@ async def get_llm_response(
                         response_style=response_style,
                         temperature=temperature,
                         api_key=key,
+                        rag_context=rag_context,
                     ),
                     timeout=15,
                 )
                 _update_diagnostics("gemini", None)
+                store_exchange(session_id, user_message, text)
                 return text
             except Exception as e:
                 err = str(e)
@@ -343,35 +375,25 @@ async def get_llm_response(
                 _update_diagnostics("gemini", err)
                 break
 
-    # 2) Groq fallback
-    if os.getenv("GROQ_API_KEY", ""):
-        try:
-            text = await call_with_timeout(
-                _call_groq(user_message, history, nlp_results, response_style),
-                timeout=15,
-            )
-            if text:
-                _update_diagnostics("groq", None)
-                return text
-        except Exception as e:
-            _update_diagnostics("groq", str(e))
-
     # 3) Ollama fallback
     try:
         if await _is_ollama_available():
             text = await call_with_timeout(
-                _call_ollama(user_message, history, nlp_results, response_style),
+                _call_ollama(user_message, history, nlp_results, response_style, rag_context),
                 timeout=15,
             )
             if text:
                 _update_diagnostics("ollama", None)
+                store_exchange(session_id, user_message, text)
                 return text
     except Exception as e:
         _update_diagnostics("ollama", str(e))
 
     # 4) Smart Template fallback (guaranteed)
     _update_diagnostics("local", None)
-    return _smart_template_response(user_message, nlp_results)
+    text = _smart_template_response(user_message, nlp_results)
+    store_exchange(session_id, user_message, text)
+    return text
 
 
 def _default_followups() -> List[str]:
